@@ -23,6 +23,7 @@ use OCA\OIDCIdentityProvider\Db\ClientMapper;
 use OCA\OIDCIdentityProvider\Db\RedirectUri;
 use OCA\OIDCIdentityProvider\Db\RedirectUriMapper;
 use OCA\OIDCIdentityProvider\Db\LogoutRedirectUriMapper;
+use OCA\OIDCIdentityProvider\Service\RegistrationTokenService;
 use OCP\Security\ISecureRandom;
 use OCP\AppFramework\Http\Attribute\BruteForceProtection;
 use OCP\AppFramework\Http\Attribute\AnonRateLimit;
@@ -42,6 +43,8 @@ class DynamicRegistrationController extends ApiController
     private $redirectUriMapper;
     /** @var LogoutRedirectUriMapper  */
     private $logoutRedirectUriMapper;
+    /** @var RegistrationTokenService */
+    private $registrationTokenService;
     /** @var ITimeFactory */
     private $time;
     /** @var Throttler */
@@ -64,6 +67,7 @@ class DynamicRegistrationController extends ApiController
                     AccessTokenMapper $accessTokenMapper,
                     RedirectUriMapper $redirectUriMapper,
                     LogoutRedirectUriMapper $logoutRedirectUriMapper,
+                    RegistrationTokenService $registrationTokenService,
                     ITimeFactory $time,
                     Throttler $throttler,
                     IURLGenerator $urlGenerator,
@@ -77,6 +81,7 @@ class DynamicRegistrationController extends ApiController
         $this->accessTokenMapper = $accessTokenMapper;
         $this->redirectUriMapper = $redirectUriMapper;
         $this->logoutRedirectUriMapper = $logoutRedirectUriMapper;
+        $this->registrationTokenService = $registrationTokenService;
         $this->time = $time;
         $this->throttler = $throttler;
         $this->urlGenerator = $urlGenerator;
@@ -102,6 +107,8 @@ class DynamicRegistrationController extends ApiController
         string $id_token_signed_response_alg = 'RS256',
         array $response_types = ['code'],
         string $application_type = 'web',
+        string|null $scope = null,
+        string $token_type = 'Bearer',
         ): JSONResponse
     {
         if ($this->appConfig->getAppValueString('dynamic_client_registration', 'false') != 'true') {
@@ -157,10 +164,24 @@ class DynamicRegistrationController extends ApiController
             $name = substr($client_name, 0, 64);
         }
 
+        // Honor client's requested token type from DCR, fall back to server default if not specified or invalid
+        $accessTokenType = $token_type;
+
+        // Validate token_type and fall back to server default if invalid
+        if (!in_array($accessTokenType, ['Bearer', 'JWT'], true)) {
+            $accessTokenType = $this->appConfig->getAppValueString(
+                Application::APP_CONFIG_DEFAULT_TOKEN_TYPE,
+                Application::DEFAULT_TOKEN_TYPE
+            );
+        }
+
         $client = new Client(
             $name,
             $redirect_uris,
             $id_token_signed_response_alg,
+            'confidential',  // type
+            'code',          // flowType
+            $accessTokenType // Use client's requested token type (or server default if invalid)
         );
 
         $client->setDcr(true);
@@ -181,10 +202,8 @@ class DynamicRegistrationController extends ApiController
             $client->setAllowedScopes($scope);
         }
 
-        // Validate and set access token type if provided
-        // The $token_type parameter here is legacy and refers to the OAuth2 token_type (Bearer)
-        // not the access token format (jwt vs opaque), so we ignore it
-        // Access token format is always the configured default for DCR clients
+        // Note: token_type parameter controls access token format (JWT vs Bearer/opaque)
+        // Client's choice is honored above, with server default as fallback for invalid values
 
         $response_types_arr = array();
         array_push($response_types_arr, 'code');
@@ -200,10 +219,18 @@ class DynamicRegistrationController extends ApiController
 
         $client = $this->clientMapper->insert($client);
 
+        // Generate registration access token (RFC 7592)
+        $registrationToken = $this->registrationTokenService->generateToken($client->getId());
+
         $jsonResponse = [
             'client_name' => $client->getName(),
             'client_id' => $client->getClientIdentifier(),
             'client_secret' => $client->getSecret(),
+            'registration_access_token' => $registrationToken->getToken(),
+            'registration_client_uri' => $this->urlGenerator->linkToRouteAbsolute(
+                'oidc.DynamicRegistration.getClientConfiguration',
+                ['clientId' => $client->getClientIdentifier()]
+            ),
             'redirect_uris' => $redirect_uris,
             'token_endpoint_auth_method' => 'client_secret_post', // Force to use client secret post
             'response_types' => $response_types_arr,
@@ -211,7 +238,9 @@ class DynamicRegistrationController extends ApiController
             'id_token_signed_response_alg' => $client->getSigningAlg(),
             'application_type' => $application_type,
             'client_id_issued_at' => $client->getIssuedAt(),
-            'client_secret_expires_at' => $client->getIssuedAt() + $this->appConfig->getAppValueString('client_expire_time', Application::DEFAULT_CLIENT_EXPIRE_TIME)
+            'client_secret_expires_at' => $client->getIssuedAt() + $this->appConfig->getAppValueString('client_expire_time', Application::DEFAULT_CLIENT_EXPIRE_TIME),
+            'scope' => $client->getAllowedScopes(),
+            'token_type' => $client->getTokenType()
         ];
 
         $response = new JSONResponse($jsonResponse, Http::STATUS_CREATED);
@@ -229,96 +258,123 @@ class DynamicRegistrationController extends ApiController
     }
 
     /**
-     * Authenticate client using either Authorization header (Basic) or POST body
+     * Authenticate using registration access token (RFC 7592)
+     * Validates Bearer token from Authorization header
      *
-     * @return Client|null
+     * @return int|null Client ID if token is valid, null otherwise
      */
-    private function authenticateClient(): ?Client
+    private function authenticateWithRegistrationToken(): ?int
     {
-        $clientId = null;
-        $clientSecret = null;
-
-        // Check for Authorization: Basic header
         $authHeader = $this->request->getHeader('Authorization');
-        if ($authHeader && stripos($authHeader, 'Basic ') === 0) {
-            $base64 = substr($authHeader, 6);
-            $decoded = base64_decode($base64, true);
-            if ($decoded !== false && strpos($decoded, ':') !== false) {
-                list($clientId, $clientSecret) = explode(':', $decoded, 2);
-            }
-        }
 
-        // Fallback to POST body parameters
-        if ($clientId === null) {
-            $clientId = $this->request->getParam('client_id');
-            $clientSecret = $this->request->getParam('client_secret');
-        }
-
-        if ($clientId === null || $clientSecret === null) {
+        if (!$authHeader || !str_starts_with($authHeader, 'Bearer ')) {
+            $this->logger->debug('Missing or invalid Authorization header for registration token');
             return null;
         }
 
-        try {
-            $client = $this->clientMapper->getByIdentifier($clientId);
-            if ($client->getSecret() === $clientSecret) {
-                return $client;
-            }
-        } catch (\Exception $e) {
-            $this->logger->debug('Client not found: ' . $clientId);
+        $token = substr($authHeader, 7);  // Remove "Bearer " prefix
+
+        if (empty($token)) {
+            $this->logger->debug('Empty Bearer token in Authorization header');
+            return null;
         }
 
-        return null;
+        return $this->registrationTokenService->validateToken($token);
     }
 
     /**
      * Authenticate and authorize client for management operations
+     * Uses RFC 7592 registration_access_token (Bearer token)
      *
      * @param string $clientId The client ID from the URL
      * @return Client|JSONResponse Returns Client on success, JSONResponse on error
      */
     private function authenticateAndAuthorizeClientManagement(string $clientId)
     {
-        $authenticatedClient = $this->authenticateClient();
-        if ($authenticatedClient === null) {
-            $this->logger->info('Client management failed: invalid credentials');
+        $authenticatedClientId = $this->authenticateWithRegistrationToken();
+
+        if ($authenticatedClientId === null) {
+            $this->logSecurityEvent('client_config_auth_failed', $clientId, false);
             return new JSONResponse([
-                'error' => 'invalid_client',
-                'error_description' => 'Client authentication failed.'
+                'error' => 'invalid_token',
+                'error_description' => 'Invalid or missing registration access token.'
             ], Http::STATUS_UNAUTHORIZED);
         }
 
-        if ($authenticatedClient->getClientIdentifier() !== $clientId) {
-            $this->logger->info('Client management failed: clientId mismatch');
+        try {
+            $client = $this->clientMapper->getByUid($authenticatedClientId);
+        } catch (\Exception $e) {
+            $this->logger->error('Client not found for authenticated token', [
+                'app' => 'oidc',
+                'client_id_from_token' => $authenticatedClientId,
+            ]);
+            return new JSONResponse([
+                'error' => 'invalid_token',
+                'error_description' => 'Token does not correspond to a valid client.'
+            ], Http::STATUS_UNAUTHORIZED);
+        }
+
+        if ($client->getClientIdentifier() !== $clientId) {
+            $this->logger->warning('Client management failed: clientId mismatch', [
+                'app' => 'oidc',
+                'requested_client' => $clientId,
+                'authenticated_client' => $client->getClientIdentifier(),
+            ]);
             return new JSONResponse([
                 'error' => 'unauthorized_client',
-                'error_description' => 'Client can only manage itself.'
+                'error_description' => 'Token does not match the requested client.'
             ], Http::STATUS_FORBIDDEN);
         }
 
-        if (!$authenticatedClient->getDcr()) {
-            $this->logger->info('Client management failed: not a DCR client');
+        if (!$client->getDcr()) {
+            $this->logger->warning('Client management failed: not a DCR client', [
+                'app' => 'oidc',
+                'client_id' => $clientId,
+            ]);
             return new JSONResponse([
                 'error' => 'invalid_client',
                 'error_description' => 'Only dynamically registered clients can be managed.'
             ], Http::STATUS_FORBIDDEN);
         }
 
-        return $authenticatedClient;
+        $this->logSecurityEvent('client_config_access', $clientId, true);
+        return $client;
+    }
+
+    /**
+     * Log security events for audit trail
+     *
+     * @param string $event The event type
+     * @param string $clientId The client identifier
+     * @param bool $success Whether the event was successful
+     */
+    private function logSecurityEvent(string $event, string $clientId, bool $success): void
+    {
+        $this->logger->info("DCR: $event", [
+            'app' => 'oidc',
+            'client_id' => $clientId,
+            'success' => $success,
+            'ip' => $this->request->getRemoteAddress(),
+            'user_agent' => $this->request->getHeader('User-Agent'),
+        ]);
     }
 
     /**
      * @PublicPage
      * @NoCSRFRequired
+     * @BruteForceProtection(action=oidc_client_config)
      *
      * @param string $clientId The client identifier
      * @return JSONResponse
      */
+    #[BruteForceProtection(action: 'oidc_client_config')]
     #[NoCSRFRequired]
     #[PublicPage]
     public function getClientConfiguration(string $clientId): JSONResponse
     {
         $client = $this->authenticateAndAuthorizeClientManagement($clientId);
         if ($client instanceof JSONResponse) {
+            $client->throttle(['clientId' => $clientId]);
             return $client;
         }
 
@@ -338,6 +394,10 @@ class DynamicRegistrationController extends ApiController
         $jsonResponse = [
             'client_id' => $client->getClientIdentifier(),
             'client_secret' => $client->getSecret(),
+            'registration_client_uri' => $this->urlGenerator->linkToRouteAbsolute(
+                'oidc.DynamicRegistration.getClientConfiguration',
+                ['clientId' => $client->getClientIdentifier()]
+            ),
             'client_name' => $client->getName(),
             'redirect_uris' => $redirectUris,
             'token_endpoint_auth_method' => 'client_secret_post',
@@ -360,6 +420,7 @@ class DynamicRegistrationController extends ApiController
     /**
      * @PublicPage
      * @NoCSRFRequired
+     * @BruteForceProtection(action=oidc_client_config)
      *
      * @param string $clientId The client identifier
      * @param array|null $redirect_uris Updated redirect URIs
@@ -369,6 +430,7 @@ class DynamicRegistrationController extends ApiController
      * @param string|null $scope Updated scope
      * @return JSONResponse
      */
+    #[BruteForceProtection(action: 'oidc_client_config')]
     #[NoCSRFRequired]
     #[PublicPage]
     public function updateClientConfiguration(
@@ -381,6 +443,7 @@ class DynamicRegistrationController extends ApiController
     ): JSONResponse {
         $client = $this->authenticateAndAuthorizeClientManagement($clientId);
         if ($client instanceof JSONResponse) {
+            $client->throttle(['clientId' => $clientId]);
             return $client;
         }
 
@@ -433,6 +496,9 @@ class DynamicRegistrationController extends ApiController
 
         $this->clientMapper->update($client);
 
+        // Rotate registration access token on update (RFC 7592)
+        $newToken = $this->registrationTokenService->rotateToken($client->getId());
+
         // Get current redirect URIs for response
         $currentRedirectUris = [];
         foreach ($this->redirectUriMapper->findByClientId($client->getId()) as $redirectUri) {
@@ -449,6 +515,11 @@ class DynamicRegistrationController extends ApiController
         $jsonResponse = [
             'client_id' => $client->getClientIdentifier(),
             'client_secret' => $client->getSecret(),
+            'registration_access_token' => $newToken->getToken(),
+            'registration_client_uri' => $this->urlGenerator->linkToRouteAbsolute(
+                'oidc.DynamicRegistration.getClientConfiguration',
+                ['clientId' => $client->getClientIdentifier()]
+            ),
             'client_name' => $client->getName(),
             'redirect_uris' => $currentRedirectUris,
             'token_endpoint_auth_method' => 'client_secret_post',
@@ -471,16 +542,19 @@ class DynamicRegistrationController extends ApiController
     /**
      * @PublicPage
      * @NoCSRFRequired
+     * @BruteForceProtection(action=oidc_client_config)
      *
      * @param string $clientId The client identifier
      * @return JSONResponse
      */
+    #[BruteForceProtection(action: 'oidc_client_config')]
     #[NoCSRFRequired]
     #[PublicPage]
     public function deleteClientConfiguration(string $clientId): JSONResponse
     {
         $client = $this->authenticateAndAuthorizeClientManagement($clientId);
         if ($client instanceof JSONResponse) {
+            $client->throttle(['clientId' => $clientId]);
             return $client;
         }
 
